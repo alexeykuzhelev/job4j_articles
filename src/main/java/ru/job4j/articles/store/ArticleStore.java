@@ -17,7 +17,9 @@ import java.util.Properties;
 public class ArticleStore implements Store<Article>, AutoCloseable {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(ArticleStore.class.getSimpleName());
+    private static final int BATCH_SIZE = 1000;
 
+    private final List<Article> buffer = new ArrayList<>(BATCH_SIZE);
     private final Properties properties;
 
     private Connection connection;
@@ -55,20 +57,44 @@ public class ArticleStore implements Store<Article>, AutoCloseable {
 
     @Override
     public Article save(Article model) {
-        LOGGER.info("Сохранение статьи");
-        var sql = "insert into articles(text) values(?)";
-        try (var statement = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
-            statement.setString(1, model.getText());
-            statement.executeUpdate();
-            var key = statement.getGeneratedKeys();
-            while (key.next()) {
-                model.setId(key.getInt(1));
-            }
-        } catch (Exception e) {
-            LOGGER.error("Не удалось выполнить операцию: { }", e.getCause());
-            throw new IllegalStateException();
+        buffer.add(model);
+        if (buffer.size() >= BATCH_SIZE) {
+            flush();
+            System.gc();
         }
         return model;
+    }
+
+    public void flush() {
+        if (buffer.isEmpty()) {
+            return;
+        }
+
+        var sql = "insert into articles(text) values(?)";
+        try (var statement = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+            /* Пакетная вставка записей в запрос */
+            for (Article article : buffer) {
+                statement.setString(1, article.getText());
+                statement.addBatch();
+            }
+
+            statement.executeBatch();
+
+            /* Обработка сгенерированных ключей */
+            try (var key = statement.getGeneratedKeys()) {
+                for (int i = 0; i < buffer.size(); i++) {
+                    if (!key.next()) {
+                        throw new SQLException("Не удалось получить сгенерированный ID");
+                    }
+                    int id = key.getInt(1);
+                    buffer.get(i).setId(id);
+                }
+            }
+            buffer.clear();
+        } catch (Exception e) {
+            LOGGER.error("Ошибка пакетной вставки записей в БД", e.getCause());
+            throw new IllegalStateException(e);
+        }
     }
 
     @Override
@@ -93,6 +119,8 @@ public class ArticleStore implements Store<Article>, AutoCloseable {
 
     @Override
     public void close() throws Exception {
+        /* Сохраняем остатки записей и закрываем подключение к БД */
+        flush();
         if (connection != null) {
             connection.close();
         }
